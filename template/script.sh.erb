@@ -1,115 +1,27 @@
 #!/usr/bin/env bash
-
-<%-
-  session_dir = session.staged_root
-  tutorial_dir = session.staged_root.join('ParallelR')
-
-  match = /^app_rstudio_server\/(.+)$|.+ R\/(.+)/.match(context.version)
-  r_version = match[1] unless match[1].nil?
-  r_version = match[2] unless match[2].nil?
-
-  all_modules = if r_version >= '4.2' && ['kubernetes', 'kubernetes-test', 'kubernetes-dev'].include?(context.cluster)
-                  "gnu/11.2.0 mkl/2021.3.0 #{context.version}"
-                else
-                  context.version
-                end
-%>
-
-# Load the required environment
-setup_env () {
-  module purge
-
-  module load project/ondemand
-  <%- if context.cluster !~ /kubernetes|ascend|cardinal/ -%>
-  module load rstudio_launcher/centos7
-  <%- end -%>
-  module load <%= all_modules %>
-}
-
-setup_env
-
-
-export WORKING_DIR="<%= session_dir %>"
-
-#
-# Start RStudio Server
-#
-# PAM auth helper used by RStudio
-export RSTUDIO_AUTH="$WORKING_DIR/bin/auth"
-
-# Generate an `rsession` wrapper script
-export RSESSION_WRAPPER_FILE="$WORKING_DIR/rsession.sh"
-(
-umask 077
-sed 's/^ \{2\}//' > "$WORKING_DIR/rsession.sh" << EOL
-  #!/usr/bin/env bash
-
-  # Log all output from this script
-  export RSESSION_LOG_FILE="$WORKING_DIR/rsession.log"
-
-  exec &>>"\${RSESSION_LOG_FILE}"
-  set -x
-
-  # rsession.sh doesn't share the same env as the outside script, so these
-  # need to be set explicitly
-  export R_LIBS_SITE="${R_LIBS_SITE}"
-  export TZ="US/Eastern"
-  export HOME="$HOME"
-  export MODULEPATH_ROOT="$MODULEPATH_ROOT"
-  export MODULEPATH="$MODULEPATH"
-  export LMOD_PKG="$LMOD_PKG"
-
-  env
-
-  # Launch the original command
-  echo "Launching rsession..."
-  exec rsession --r-libs-user "${R_LIBS_USER}" "\${@}"
-EOL
-)
-chmod 700 "$WORKING_DIR/rsession.sh"
-
-# Set working directory to home directory
-cd "${HOME}"
-
-# Output debug info
-module list
-hostname
-
-# server log directory in this job's working directory
-mkdir -p "$WORKING_DIR/logs"
-
-# use the system installed rserver
-export PATH="$PATH:/usr/lib/rstudio-server/bin"
-
 set -x
+
+echo $HOME
+
+TMPBASE="${TMPDIR:-$HOME/rstudio-tmp}"
+
+# 1) Per-job writable dirs + cookie
+mkdir -p "$TMPBASE"/{var_run,var_lib,tmp/rstudio-server}
+
 # Launch the RStudio Server
 echo "Starting up rserver... at $(date)"
 
-<%- if context.cluster !~ /kubernetes/ -%>
-bwrap --dev-bind / / --tmpfs /tmp \
- --bind $WORKING_DIR/etc /etc/rstudio \
- --setenv LD_LIBRARY_PATH "$LD_LIBRARY_PATH" \
-  rserver \
- --www-port "${port}" \
- --auth-none 0 \
- --auth-pam-helper-path "${RSTUDIO_AUTH}" \
- --auth-encrypt-password 0 \
- --rsession-path "${RSESSION_WRAPPER_FILE}" \
- <%- if r_version > '4.1' -%>
- --server-data-dir='/tmp/run' \
- --server-user=$(whoami)
- <%- end -%>
+# Build the apptainer exec command
+APPTAINER_CMD=(apptainer exec
+  -B "${HOME}:${HOME}" \
+  -B "$TMPBASE/var_run:/var/run" \
+  -B "$TMPBASE/var_run:/run" \
+  -B "$TMPBASE/var_lib:/var/lib/rstudio-server" \
+  -B "$TMPBASE/tmp:/tmp" \
+  <%= context.binds.blank? ? '' : "-B #{context.binds}" %>
+  "<%= context.image %>")
 
-<%- else -%>
-cd ${APPTAINER_HOME:=$HOME}
-rserver \
-  --www-port 8080 \
-  --auth-none 0 \
-  --auth-pam-helper-path "${RSTUDIO_AUTH}" \
-  --auth-encrypt-password 0 \
-  --rsession-path "${RSESSION_WRAPPER_FILE}" \
-  <%- if r_version > '4.1' -%>
-  --server-data-dir='/tmp/run' \
-  --server-user=$(whoami)
-  <%- end -%>
-<%- end -%>
+exec "${APPTAINER_CMD[@]}" rserver \
+  --www-port "${port}" \
+  --server-user="$USER"
+
